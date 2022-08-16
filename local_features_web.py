@@ -1,6 +1,7 @@
 import uvicorn
 if __name__ == '__main__':
     uvicorn.run('local_features_web:app', host='127.0.0.1', port=33333, log_level="info")
+    exit()
 
 from typing import Optional, Union
 import cv2
@@ -17,46 +18,68 @@ import faiss
 import lmdb
 import psycopg2
 import pydegensac
+from kornia_moons import feature
+from PIL import Image
+import io 
 
 dim = 128
 index = None
 DATA_CHANGED_SINCE_LAST_SAVE = False
-
-from kornia_moons import feature
 laf_from_opencv_SIFT_kpts = feature.laf_from_opencv_SIFT_kpts
-
 detector = cv2.SIFT_create(nfeatures=200)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 HardNet8 = KF.HardNet8(True).eval().to(device)
-POINT_ID = 0
-FIND_MIRRORED = True
+LAST_POINT_ID = 1
+#FIND_MIRRORED = True
+app = FastAPI()
 
+def main():
+    global app, DB_img_points, DB_keypoints, DB_descriptors, LAST_POINT_ID
+    DB_img_points = prepare_db()
+    DB_keypoints = lmdb.open('./keypoints.lmdb',map_size=1 * 1000 * 1_000_000) #1gb
+    DB_descriptors = lmdb.open('./descriptors.lmdb',map_size=5 * 1000 * 1_000_000) #5gb
+    init_index()
+    if DB_keypoints.stat()["entries"] != DB_descriptors.stat()["entries"]:
+        print('DB_keypoints.stat()["entries"] != DB_descriptors.stat()["entries"]')
+        exit()
+    with DB_keypoints.begin(buffers=True) as txn:
+        with txn.cursor() as curs:
+            for key in curs.iternext(keys=True, values=False):
+                key = int_from_bytes(key)
+                LAST_POINT_ID = max(LAST_POINT_ID,key)
+    if LAST_POINT_ID != 1:
+        LAST_POINT_ID+=1
+    loop = asyncio.get_event_loop()
+    loop.call_later(10, periodically_save_index,loop)
+
+def int_from_bytes(xbytes: bytes) -> int:
+    return int.from_bytes(xbytes, 'big')
+
+def create_table(conn):
+    cur = conn.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS img_points (
+            image_id integer NOT NULL UNIQUE,
+            point_id_range int4range NOT NULL)""")
+    cur.execute('CREATE INDEX IF NOT EXISTS point_id_range_gist_index ON img_points USING GIST (point_id_range);')
+    conn.commit()
 
 def prepare_db():
-    conn = psycopg2.connect("dbname=postgres host=localhost user=postgres password=12345")
+    connect_settings_postgres = "dbname=postgres host=localhost user=postgres password=12345"
+    connect_settings_ambience = "dbname=ambience host=localhost user=postgres password=12345"
+    conn = psycopg2.connect(connect_settings_postgres)
     cur = conn.cursor()
     cur.execute("SELECT 1 FROM pg_catalog.pg_database WHERE datname = 'ambience'")
     exists = cur.fetchone()
-    conn.commit()
     if not exists:
         conn.autocommit = True
         cur.execute('CREATE DATABASE ambience')
-        conn = psycopg2.connect("dbname=ambience host=localhost user=postgres password=12345")
-        cur = conn.cursor()
-        cur.execute("""CREATE TABLE IF NOT EXISTS img_points (
-            image_id integer NOT NULL UNIQUE,
-            point_id_range int4range NOT NULL)""")
-        cur.execute('CREATE INDEX point_id_range_gist_index ON img_points USING GIST (point_id_range);')
-        conn.commit()
+        conn = psycopg2.connect(connect_settings_ambience)
+        create_table(conn)
         return conn
     else:
-        conn = psycopg2.connect("dbname=ambience host=localhost user=postgres password=12345")
+        conn = psycopg2.connect(connect_settings_ambience)
+        create_table(conn)
         return conn
-
-DB_img_points = prepare_db()
-DB_keypoints = lmdb.open('./keypoints.lmdb',map_size=6* 1000 * 1_000_000) #6gb
-DB_descriptors = lmdb.open('./descriptors.lmdb',map_size=120 * 1000 * 1_000_000) #120gb
-
 
 def int_to_bytes(x: int) -> bytes:
     return x.to_bytes((x.bit_length() + 7) // 8, 'big')
@@ -123,21 +146,18 @@ def delete_keypoints(point_ids):
         for point_id in point_ids:
             txn.delete(point_id)
 
-def read_img_file(image_data):
-    return np.fromstring(image_data, np.uint8)
-
-def resize_img_to_threshold(img):
-    height, width = img.shape
-    threshold = 3000*3000
-    if height*width > threshold:
-        k = math.sqrt(height*width/(threshold))
-        img = cv2.resize(img, (round(width/k), round(height/k)), interpolation=cv2.INTER_LINEAR)
+def read_img_buffer(image_data):
+    img = Image.open(io.BytesIO(image_data))
+    if img.mode != 'L':
+        img = img.convert('L')
     return img
 
-
-def preprocess_image(image_buffer):
-    img = cv2.imdecode(read_img_file(image_buffer), 0)
-    img = resize_img_to_threshold(img)
+def resize_img_to_threshold(img):
+    width, height = img.size
+    threshold = 3000*3000
+    if height*width > threshold:
+        k = math.sqrt(height*width/threshold)
+        img = img.resize((round(width/k), round(height/k)),Image.Resampling.LANCZOS)
     return img
 
 def get_kpts_and_descs_by_id(image_id):
@@ -157,19 +177,22 @@ def get_kpts_and_descs_by_id(image_id):
                 descs[i]=np.frombuffer(_descs[i][1], dtype=np.float32)
     return kpts, descs
 
-def get_features(img, mirrored=False):
+def get_features(image_buffer, mirrored=False):
+    img = read_img_buffer(image_buffer)
+    img = resize_img_to_threshold(img)
+    img = np.array(img)
     if mirrored:
-        img = cv2.flip(img, 1)
+        img = np.fliplr(img)
     kpts = detector.detect(img, None)
     if len(kpts) == 0:
         return None
     with torch.no_grad():
-            timg = K.image_to_tensor(img, False).float()/255.
-            timg = timg.to(device)
-            lafs = laf_from_opencv_SIFT_kpts(kpts, device=device)
-            patches = KF.extract_patches_from_pyramid(timg, lafs, 32)
-            B, N, CH, H, W = patches.size()
-            descs = HardNet8(patches.view(B * N, CH, H, W)).view(B * N, -1).detach().cpu().numpy()   
+        timg = K.image_to_tensor(img, False).float()/255.
+        timg = timg.to(device)
+        lafs = laf_from_opencv_SIFT_kpts(kpts, device=device)
+        patches = KF.extract_patches_from_pyramid(timg, lafs, 32)
+        B, N, CH, H, W = patches.size()
+        descs = HardNet8(patches.view(B * N, CH, H, W)).view(B * N, -1).cpu().numpy()   
     kpts = np.float32([x.pt for x in kpts]).reshape(-1,2)
     return kpts, descs
 
@@ -178,7 +201,7 @@ def verify_pydegensac(src_pts,dst_pts,th = 4,  n_iter = 2000):
     return int(mask.sum())
 
 def local_features_search(orig_keypoints,target_features, k, k_clusters, min_matches, matching_threshold,
-use_snn_matching, snn_match_threshold,use_ransac):
+use_smnn_matching, smnn_match_threshold,use_ransac):
     D, I = index.search(target_features, k_clusters)
     D = D.flatten()
     I = I.flatten()
@@ -194,38 +217,39 @@ use_snn_matching, snn_match_threshold,use_ransac):
             else:
                 search_res[image_id] = 1
     res=[{"image_id":img_id, "matches":int(matches)} for img_id,matches in sorted(search_res.items(), key=lambda item: item[1],reverse=True) if matches>=min_matches]
-    if use_snn_matching:
+    if use_smnn_matching:
         new_res = []
         for item in res:
             kpts, descs = get_kpts_and_descs_by_id(item["image_id"])
-            dists, match_ids = KF.match_snn(torch.from_numpy(target_features), torch.from_numpy(descs), snn_match_threshold)
-            if use_ransac:
-                if len(dists) > 3:
-                    new_res.append({"image_id":item["image_id"],"matches":verify_pydegensac(orig_keypoints[match_ids[:,0]],kpts[match_ids[:,1]])})
-            else:
-                new_res.append({"image_id":item["image_id"],"matches":len(dists)})
+            dists, match_ids = KF.match_smnn(torch.from_numpy(target_features), torch.from_numpy(descs), smnn_match_threshold)
+            if len(dists) != 0:
+                if use_ransac:
+                    if len(dists) > 3:
+                        new_res.append({"image_id":item["image_id"],"matches":verify_pydegensac(orig_keypoints[match_ids[:,0]],kpts[match_ids[:,1]])})
+                else:
+                    new_res.append({"image_id":item["image_id"],"matches":len(dists)})
         res = sorted(new_res, key=lambda item: item["matches"], reverse=True)
     if k:
         return res[:k]
     return res
 
-app = FastAPI()
+
 @app.get("/")
 async def read_root():
     return {"Hello": "World"}
 
-class Item_image_id(BaseModel):
+class Item_local_features_get_similar_images_by_id(BaseModel):
     image_id: int
     k: Union[str,int,None] = None
     k_clusters: Union[str,int,None] = None
     min_matches: Union[str,int,None] = None
     matching_threshold: Union[str,float,None] = None
-    use_snn_matching: Union[str,int,None] = None
-    snn_match_threshold: Union[str,float,None] = None
+    use_smnn_matching: Union[str,int,None] = None
+    smnn_match_threshold: Union[str,float,None] = None
     use_ransac: Union[str,int,None] = None
 
 @app.post("/local_features_get_similar_images_by_id")
-async def local_features_get_similar_images_by_id_handler(item: Item_image_id):
+async def local_features_get_similar_images_by_id_handler(item: Item_local_features_get_similar_images_by_id):
     try:
         image_id = int(item.image_id)
         k=item.k
@@ -233,8 +257,8 @@ async def local_features_get_similar_images_by_id_handler(item: Item_image_id):
         matching_threshold=item.matching_threshold
         min_matches=item.min_matches
 
-        use_snn_matching=item.use_snn_matching
-        snn_match_threshold=item.snn_match_threshold
+        use_smnn_matching=item.use_smnn_matching
+        smnn_match_threshold=item.smnn_match_threshold
         use_ransac=item.use_ransac
 
         if k:
@@ -254,20 +278,20 @@ async def local_features_get_similar_images_by_id_handler(item: Item_image_id):
         else:
             matching_threshold = 0.9  
 
-        if use_snn_matching:
-            use_snn_matching=int(use_snn_matching)
+        if use_smnn_matching:
+            use_smnn_matching=int(use_smnn_matching) #can be string, using int() to later use in a if statement as truthy/falsy value
 
-        if snn_match_threshold:
-            snn_match_threshold=float(snn_match_threshold)
+        if smnn_match_threshold:
+            smnn_match_threshold=float(smnn_match_threshold)
         else:
-            snn_match_threshold=0.8
+            smnn_match_threshold=0.8
 
         if use_ransac:
-            use_ransac=int(use_ransac)
+            use_ransac=int(use_ransac) #can be string, using int() to later use in a if statement as truthy/falsy value
 
 
         kpts, descs = get_kpts_and_descs_by_id(image_id)
-        similar = local_features_search(kpts, descs, k, k_clusters, min_matches, matching_threshold, use_snn_matching, snn_match_threshold, use_ransac)
+        similar = local_features_search(kpts, descs, k, k_clusters, min_matches, matching_threshold, use_smnn_matching, smnn_match_threshold, use_ransac)
         return similar
     except:
         raise HTTPException(
@@ -277,7 +301,7 @@ async def local_features_get_similar_images_by_id_handler(item: Item_image_id):
 async def local_features_get_similar_images_by_image_buffer_handler(image: bytes = File(...), 
  k: Optional[str] = Form(None), k_clusters: Optional[str] = Form(None),
  min_matches: Optional[str] = Form(None), matching_threshold: Optional[str] = Form(None),
- use_snn_matching: Optional[str] = Form(None), snn_match_threshold: Optional[str] = Form(None), use_ransac: Optional[str] = Form(None)):
+ use_smnn_matching: Optional[str] = Form(None), smnn_match_threshold: Optional[str] = Form(None), use_ransac: Optional[str] = Form(None)):
     try:
         if k:
             k = int(k)
@@ -296,20 +320,19 @@ async def local_features_get_similar_images_by_image_buffer_handler(image: bytes
         else:
             matching_threshold = 0.9  
 
-        if use_snn_matching:
-            use_snn_matching=int(use_snn_matching)
+        if use_smnn_matching:
+            use_smnn_matching=int(use_smnn_matching) #can be string, using int() to later use in a if statement as truthy/falsy value
 
-        if snn_match_threshold:
-            snn_match_threshold=float(snn_match_threshold)
+        if smnn_match_threshold:
+            smnn_match_threshold=float(smnn_match_threshold)
         else:
-            snn_match_threshold=0.8
+            smnn_match_threshold=0.8
 
         if use_ransac:
-            use_ransac=int(use_ransac)
-
+            use_ransac=int(use_ransac) #can be string, using int() to later use in a if statement as truthy/falsy value
         
-        kpts, descs = get_features(preprocess_image(image))
-        similar = local_features_search(kpts, descs, k, k_clusters, min_matches, matching_threshold, use_snn_matching, snn_match_threshold, use_ransac)
+        kpts, descs = get_features(image)
+        similar = local_features_search(kpts, descs, k, k_clusters, min_matches, matching_threshold, use_smnn_matching, smnn_match_threshold, use_ransac)
         return similar
     except RuntimeError:
         raise HTTPException(status_code=500, detail="Error in local_features_get_similar_images_by_image_buffer_handler")
@@ -318,30 +341,31 @@ async def local_features_get_similar_images_by_image_buffer_handler(image: bytes
 @app.post("/calculate_local_features")
 async def calculate_local_features_handler(image: bytes = File(...), image_id: str = Form(...)):
     try:
-        global POINT_ID
+        global DATA_CHANGED_SINCE_LAST_SAVE, LAST_POINT_ID
         image_id = int(image_id)
-        kpts,descs = get_features(preprocess_image(image))
+        kpts,descs = get_features(image)
         if descs is None:
             raise HTTPException(status_code=500, detail="No descriptors for this image")
-        start = POINT_ID
-        end = POINT_ID + len(kpts)
-        POINT_ID+=len(kpts)+1
+        start = LAST_POINT_ID
+        end = LAST_POINT_ID + len(kpts) - 1
+        LAST_POINT_ID+=len(kpts)
         add_img_points(image_id,start,end)
         point_ids = list(range(start,end+1))
         point_ids_bytes = [int_to_bytes(x) for x in point_ids]
         add_keypoints(point_ids_bytes, kpts)
         add_descriptors(point_ids_bytes, descs)
         index.add_with_ids(descs, np.int64(point_ids))
+        DATA_CHANGED_SINCE_LAST_SAVE = True
         return Response(status_code=status.HTTP_200_OK)
     except:
         raise HTTPException(status_code=500, detail="Can't calculate local features")
 
 
-class Item(BaseModel):
+class Item_delete_local_features(BaseModel):
     image_id: int
 
 @app.post("/delete_local_features")
-async def delete_local_features_handler(item: Item):
+async def delete_local_features_handler(item: Item_delete_local_features):
     global DATA_CHANGED_SINCE_LAST_SAVE
     try:
         image_id = int(item.image_id)
@@ -365,9 +389,5 @@ def periodically_save_index(loop):
         DATA_CHANGED_SINCE_LAST_SAVE=False
         faiss.write_index(index, "./populated.index")
     loop.call_later(10, periodically_save_index,loop)
-
-print(__name__)
-if __name__ == 'local_features_web':
-    init_index()
-    loop = asyncio.get_event_loop()
-    loop.call_later(10, periodically_save_index,loop)
+    
+main()

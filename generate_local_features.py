@@ -209,7 +209,7 @@ if __name__ == '__main__': #entry point
     id_kpts_descs = []
 
     for batch_ids, batch_images, batch_kpts in tqdm(dataloader):
-        if len(batch_ids==0):
+        if len(batch_ids) == 0 :
             continue
         for id, image, kpts in zip(batch_ids, batch_images, batch_kpts):
             descs = get_features(image, kpts)

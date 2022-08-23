@@ -17,7 +17,6 @@ from pydantic import BaseModel
 import faiss
 import lmdb
 import psycopg2
-import pydegensac
 from kornia_moons import feature
 from PIL import Image
 import io 
@@ -197,7 +196,7 @@ def get_features(image_buffer, mirrored=False):
     return kpts, descs
 
 def verify_pydegensac(src_pts,dst_pts,th = 4,  n_iter = 2000):
-    _, mask = pydegensac.findHomography(src_pts, dst_pts, th, 0.999, n_iter)
+    _, mask = cv2.findHomography(src_pts, dst_pts, ransacReprojThreshold=th, confidence=0.999, maxIters = n_iter,method=cv2.USAC_MAGSAC)
     return int(mask.sum())
 
 def local_features_search(orig_keypoints,target_features, k, k_clusters, min_matches, matching_threshold,

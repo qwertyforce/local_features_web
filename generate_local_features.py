@@ -53,7 +53,7 @@ class InferenceDataset(Dataset):
                 kpts = [KeyPointSimple(x.pt,x.size, x.angle, x.response) for x in kpts]
                 return (image_id, img, kpts)
             except:
-                print("error reading {img_path}")
+                print(f"error reading {img_path}")
 
 def collate_wrapper(batch):
     batch = [el for el in batch if el] #remove None
@@ -112,6 +112,7 @@ if __name__ == '__main__': #entry point
         cur.execute("SELECT 1 FROM pg_catalog.pg_database WHERE datname = 'ambience'")
         exists = cur.fetchone()
         if not exists:
+            conn.commit()
             conn.autocommit = True
             cur.execute('CREATE DATABASE ambience')
             conn = psycopg2.connect(connect_settings_ambience)
@@ -214,7 +215,7 @@ if __name__ == '__main__': #entry point
         for id, image, kpts in zip(batch_ids, batch_images, batch_kpts):
             descs = get_features(image, kpts)
             id_kpts_descs.append((id,kpts,descs))
-        if len(id_kpts_descs)>=10000:
+        if len(id_kpts_descs)>=256:
             push_data(id_kpts_descs)
             id_kpts_descs=[]
     push_data(id_kpts_descs)

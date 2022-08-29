@@ -190,6 +190,12 @@ def init_index():
         print("Index is not found! Exiting...")
         exit()
 
+def check_if_image_id_exists(image_id):
+    cursor = DB_img_points.cursor()
+    cursor.execute("select exists(select 1 from img_points where image_id=%s)",[image_id])
+    result = cursor.fetchone()
+    return result[0]
+
 def get_image_id_by_point_id(point_id):
     cursor = DB_img_points.cursor()
     cursor.execute("SELECT image_id FROM img_points WHERE point_id_range @> %s",[point_id])
@@ -211,7 +217,7 @@ def get_point_ids(image_id):
 
 def add_img_points(image_id,point_id_start,point_id_end):
     cursor = DB_img_points.cursor()
-    cursor.execute("INSERT INTO img_points (image_id, point_id_range) VALUES %s",[image_id, f'[{point_id_start},{point_id_end}]'])
+    cursor.execute("INSERT INTO img_points (image_id, point_id_range) VALUES(%s, %s)",[image_id, f'[{point_id_start},{point_id_end}]'])
     DB_img_points.commit()    
 
 def add_keypoints(point_ids, kpts):
@@ -258,6 +264,8 @@ def resize_img_to_threshold(img):
 
 def get_kpts_and_descs_by_id(image_id):
     point_ids = get_point_ids(image_id)
+    if len(point_ids)==0:
+        return None, None
     point_ids = [int_to_bytes(x) for x in point_ids]
     kpts=np.zeros( (len(point_ids), 2), dtype=np.float32 )
     descs=np.zeros( (len(point_ids), dim), dtype=np.float32 )
@@ -296,7 +304,7 @@ def verify_pydegensac(src_pts,dst_pts,th = 4,  n_iter = 2000):
     _, mask = cv2.findHomography(src_pts, dst_pts, ransacReprojThreshold=th, confidence=0.999, maxIters = n_iter,method=cv2.USAC_MAGSAC)
     return int(mask.sum())
 
-def local_features_search(orig_keypoints,target_features, k, k_clusters, min_matches, matching_threshold,
+def local_features_search(orig_keypoints,target_features, k, k_clusters, knn_min_matches, matching_threshold,
 use_smnn_matching, smnn_match_threshold,use_ransac):
     D, I = index.search(target_features, k_clusters)
     D = D.flatten()
@@ -312,7 +320,7 @@ use_smnn_matching, smnn_match_threshold,use_ransac):
                 search_res[image_id]+=1
             else:
                 search_res[image_id] = 1
-    res=[{"image_id":img_id, "matches":int(matches)} for img_id,matches in sorted(search_res.items(), key=lambda item: item[1],reverse=True) if matches>=min_matches]
+    res=[{"image_id":img_id, "matches":int(matches)} for img_id,matches in sorted(search_res.items(), key=lambda item: item[1],reverse=True) if matches>=knn_min_matches]
     if use_smnn_matching:
         new_res = []
         for item in res:
@@ -338,7 +346,7 @@ class Item_local_features_get_similar_images_by_id(BaseModel):
     image_id: int
     k: Union[str,int,None] = None
     k_clusters: Union[str,int,None] = None
-    min_matches: Union[str,int,None] = None
+    knn_min_matches: Union[str,int,None] = None
     matching_threshold: Union[str,float,None] = None
     use_smnn_matching: Union[str,int,None] = None
     smnn_match_threshold: Union[str,float,None] = None
@@ -351,7 +359,7 @@ async def local_features_get_similar_images_by_id_handler(item: Item_local_featu
         k=item.k
         k_clusters=item.k_clusters
         matching_threshold=item.matching_threshold
-        min_matches=item.min_matches
+        knn_min_matches=item.knn_min_matches
 
         use_smnn_matching=item.use_smnn_matching
         smnn_match_threshold=item.smnn_match_threshold
@@ -364,10 +372,10 @@ async def local_features_get_similar_images_by_id_handler(item: Item_local_featu
         else:
             k_clusters=5
             
-        if min_matches:
-            min_matches = int(min_matches)
+        if knn_min_matches:
+            knn_min_matches = int(knn_min_matches)
         else:
-            min_matches=1
+            knn_min_matches=1
 
         if matching_threshold:
             matching_threshold = float(matching_threshold)
@@ -387,7 +395,9 @@ async def local_features_get_similar_images_by_id_handler(item: Item_local_featu
 
 
         kpts, descs = get_kpts_and_descs_by_id(image_id)
-        similar = local_features_search(kpts, descs, k, k_clusters, min_matches, matching_threshold, use_smnn_matching, smnn_match_threshold, use_ransac)
+        if kpts is None:
+            return []
+        similar = local_features_search(kpts, descs, k, k_clusters, knn_min_matches, matching_threshold, use_smnn_matching, smnn_match_threshold, use_ransac)
         return similar
     except:
         raise HTTPException(
@@ -396,7 +406,7 @@ async def local_features_get_similar_images_by_id_handler(item: Item_local_featu
 @app.post("/local_features_get_similar_images_by_image_buffer")
 async def local_features_get_similar_images_by_image_buffer_handler(image: bytes = File(...), 
  k: Optional[str] = Form(None), k_clusters: Optional[str] = Form(None),
- min_matches: Optional[str] = Form(None), matching_threshold: Optional[str] = Form(None),
+ knn_min_matches: Optional[str] = Form(None), matching_threshold: Optional[str] = Form(None),
  use_smnn_matching: Optional[str] = Form(None), smnn_match_threshold: Optional[str] = Form(None), use_ransac: Optional[str] = Form(None)):
     try:
         if k:
@@ -406,10 +416,10 @@ async def local_features_get_similar_images_by_image_buffer_handler(image: bytes
         else:
             k_clusters=5
 
-        if min_matches:
-            min_matches = int(min_matches)
+        if knn_min_matches:
+            knn_min_matches = int(knn_min_matches)
         else:
-            min_matches=1
+            knn_min_matches=1
 
         if matching_threshold:
             matching_threshold = float(matching_threshold)
@@ -428,7 +438,7 @@ async def local_features_get_similar_images_by_image_buffer_handler(image: bytes
             use_ransac=int(use_ransac) #can be string, using int() to later use in a if statement as truthy/falsy value
         
         kpts, descs = get_features(image)
-        similar = local_features_search(kpts, descs, k, k_clusters, min_matches, matching_threshold, use_smnn_matching, smnn_match_threshold, use_ransac)
+        similar = local_features_search(kpts, descs, k, k_clusters, knn_min_matches, matching_threshold, use_smnn_matching, smnn_match_threshold, use_ransac)
         return similar
     except RuntimeError:
         raise HTTPException(status_code=500, detail="Error in local_features_get_similar_images_by_image_buffer_handler")
@@ -439,6 +449,8 @@ async def calculate_local_features_handler(image: bytes = File(...), image_id: s
     try:
         global DATA_CHANGED_SINCE_LAST_SAVE, LAST_POINT_ID
         image_id = int(image_id)
+        if check_if_image_id_exists(image_id):
+            raise HTTPException(status_code=500, detail="Image with this id is already in the db")
         kpts,descs = get_features(image)
         if descs is None:
             raise HTTPException(status_code=500, detail="No descriptors for this image")
@@ -453,7 +465,8 @@ async def calculate_local_features_handler(image: bytes = File(...), image_id: s
         index.add_with_ids(descs, np.int64(point_ids))
         DATA_CHANGED_SINCE_LAST_SAVE = True
         return Response(status_code=status.HTTP_200_OK)
-    except:
+    except Exception as e:
+        print(e)
         raise HTTPException(status_code=500, detail="Can't calculate local features")
 
 

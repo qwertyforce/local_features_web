@@ -23,6 +23,7 @@ import io
 from numba import jit
 from numba.core import types
 from numba.typed import Dict
+from lru import LRU
 
 dim = 128
 index = None
@@ -33,6 +34,7 @@ HardNet8 = KF.HardNet8(True).eval().to(device)
 LAST_POINT_ID = 1
 FIND_SPARSE_KEYPOINTS = True
 N_KEYPOINTS = 200
+LRU_CACHE = LRU(100)
 #FIND_MIRRORED = True
 app = FastAPI()
 if FIND_SPARSE_KEYPOINTS == True:
@@ -285,6 +287,9 @@ def get_features(image_buffer, mirrored=False):
     img = read_img_buffer(image_buffer)
     img = resize_img_to_threshold(img)
     img = np.array(img)
+    img_hash = hash(img.data.tobytes())
+    if img_hash in LRU_CACHE:
+        return LRU_CACHE[img_hash]
     if mirrored:
         img = np.fliplr(img)
     kpts = get_keypoints(img)
@@ -298,6 +303,7 @@ def get_features(image_buffer, mirrored=False):
         B, N, CH, H, W = patches.size()
         descs = HardNet8(patches.view(B * N, CH, H, W)).view(B * N, -1).cpu().numpy()   
     kpts = np.float32([x.pt for x in kpts]).reshape(-1,2)
+    LRU_CACHE[img_hash] = (kpts,descs)
     return kpts, descs
 
 def verify_pydegensac(src_pts,dst_pts,th = 4,  n_iter = 2000):

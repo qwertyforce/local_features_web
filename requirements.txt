@@ -12,3 +12,4 @@ pydantic==1.9.2
 tqdm==4.64.0
 uvicorn==0.18.3
 python-multipart
+lru-dict

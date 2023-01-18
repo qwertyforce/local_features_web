@@ -3,6 +3,7 @@ if __name__ == '__main__':
     uvicorn.run('local_features_web:app', host='127.0.0.1', port=33333, log_level="info")
     exit()
 
+import traceback
 from typing import Optional, Union
 import cv2
 import torch
@@ -15,15 +16,14 @@ from os.path import exists
 from fastapi import FastAPI, File, Form, HTTPException, Response, status
 from pydantic import BaseModel
 import faiss
-import lmdb
-import psycopg2
 from kornia_moons import feature
 from PIL import Image
 import io 
-from numba import jit
-from numba.core import types
-from numba.typed import Dict
 from lru import LRU
+
+from modules.psql_ops import prepare_db 
+from modules.byte_ops import int_to_bytes
+from modules.lmdb_ops import get_dbs, get_last_point_id
 
 dim = 128
 index = None
@@ -31,156 +31,25 @@ DATA_CHANGED_SINCE_LAST_SAVE = False
 laf_from_opencv_SIFT_kpts = feature.laf_from_opencv_SIFT_kpts
 device = "cuda" if torch.cuda.is_available() else "cpu"
 HardNet8 = KF.HardNet8(True).eval().to(device)
-LAST_POINT_ID = 1
+
 FIND_SPARSE_KEYPOINTS = True
 N_KEYPOINTS = 200
+from modules import keypoint_ops
+keypoint_ops.init(FIND_SPARSE_KEYPOINTS, N_KEYPOINTS)
+
 LRU_CACHE = LRU(100)
 #FIND_MIRRORED = True
 app = FastAPI()
-if FIND_SPARSE_KEYPOINTS == True:
-    detector = cv2.SIFT_create(contrastThreshold=-1)
-else:
-    detector = cv2.SIFT_create(nfeatures=N_KEYPOINTS)
 
 def main():
-    global app, DB_img_points, DB_keypoints, DB_descriptors, LAST_POINT_ID
+    global DB_img_points, DB_keypoints, DB_descriptors, LAST_POINT_ID
     DB_img_points = prepare_db()
-    DB_keypoints = lmdb.open('./keypoints.lmdb',map_size=1 * 1000 * 1_000_000) #1gb
-    DB_descriptors = lmdb.open('./descriptors.lmdb',map_size=5 * 1000 * 1_000_000) #5gb
+    DB_keypoints, DB_descriptors = get_dbs()
+
     init_index()
-    if DB_keypoints.stat()["entries"] != DB_descriptors.stat()["entries"]:
-        print('DB_keypoints.stat()["entries"] != DB_descriptors.stat()["entries"]')
-        exit()
-    with DB_keypoints.begin(buffers=True) as txn:
-        with txn.cursor() as curs:
-            for key in curs.iternext(keys=True, values=False):
-                key = int_from_bytes(key)
-                LAST_POINT_ID = max(LAST_POINT_ID,key)
-    if LAST_POINT_ID != 1:
-        LAST_POINT_ID+=1
+    LAST_POINT_ID = get_last_point_id()+1
     loop = asyncio.get_event_loop()
     loop.call_later(10, periodically_save_index,loop)
-
-@jit(nopython=True, cache=True, fastmath=True)
-def check_distance(target_keypoint_x, target_keypoint_y, keypoints, keypoints_neighbors):
-    skip_flag = False
-    for kpt in keypoints:
-        if kpt[0] == 0 and kpt[1] == 0: #_keypoints is zeroed
-            break
-        x,y = kpt
-        dist = sqrt((target_keypoint_y-y)**2 + (target_keypoint_x-x)**2)
-        if dist < 50: #is_neighbor
-            hash = ((x + y)*(x + y + 1)/2) + y # https://stackoverflow.com/a/682617
-            if keypoints_neighbors[hash] >= 3:
-                skip_flag = True
-                break
-    return skip_flag
-
-@jit(nopython=True, cache=True, fastmath=True)
-def update_neighbors(target_keypoint_x, target_keypoint_y, keypoints, keypoints_neighbors):
-    new_kpt_hash = ((target_keypoint_x + target_keypoint_y)*(target_keypoint_x + target_keypoint_y + 1)/2) + target_keypoint_y
-    keypoints_neighbors[new_kpt_hash]=0
-    for kpt in keypoints:
-        x,y = kpt
-        if x == target_keypoint_x and y == target_keypoint_y:
-            continue
-        if x == 0 and y == 0: #_keypoints is zeroed
-            break
-        dist = sqrt((target_keypoint_y-y)**2 + (target_keypoint_x-x)**2)
-        if dist < 50: #is_neighbor
-            hash = ((x + y)*(x + y + 1)/2) + y # https://stackoverflow.com/a/682617
-            keypoints_neighbors[hash]+=1
-
-def get_keypoints_sparse(img,n_features=200):
-    height= img.shape[0]
-    width= img.shape[1]
-    height_divided_by_2 = img.shape[0]//2
-    width_divided_by_2 = img.shape[1]//2
-    _keypoints = np.zeros((n_features, 2)) #_keypoints is only used to pass it to numba optimized functions, because they can't use keypoints(it's list of cv2.Keypoint)
-    kps = detector.detect(img,None)
-    kps = sorted(kps, key = lambda x:x.response,reverse=True)
-    keypoints_count = [0,0,0,0]
-    keypoints=[]
-    N = n_features//4
-    used_keypoints = 0
-    keypoints_neighbors = Dict.empty(key_type=types.float64, value_type=types.int64)
-    def add_kpt(kpt):
-        nonlocal used_keypoints, _keypoints, keypoints
-        x,y = kpt.pt
-        _keypoints[used_keypoints][0] = x
-        _keypoints[used_keypoints][1] = y
-        keypoints.append(kpt)
-        update_neighbors(x, y, _keypoints, keypoints_neighbors)
-        used_keypoints+=1
-
-    for keypoint in kps:
-        keypoint_x,keypoint_y=keypoint.pt
-        if len(keypoints) != 0:
-            skip_keypoint = check_distance(keypoint_x, keypoint_y, _keypoints, keypoints_neighbors)
-            if skip_keypoint:
-                continue
-
-        if used_keypoints == 200:
-            break
-
-        if keypoints_count[0]<N and 0<keypoint_y<height_divided_by_2 and 0<keypoint_x<width_divided_by_2:
-            add_kpt(keypoint)
-            keypoints_count[0]+=1
-            continue
-
-        if keypoints_count[1]<N and 0<keypoint_y<height_divided_by_2 and width_divided_by_2<keypoint_x<width:
-            add_kpt(keypoint)
-            keypoints_count[1]+=1
-            continue
-
-        if keypoints_count[2]<N and height_divided_by_2<keypoint_y<height and 0<keypoint_x<width_divided_by_2:
-            add_kpt(keypoint)
-            keypoints_count[2]+=1
-            continue
-
-        if keypoints_count[3]<N and height_divided_by_2<keypoint_y<height and 0<width_divided_by_2<keypoint_x<width:
-            add_kpt(keypoint)
-            keypoints_count[3]+=1
-            continue
-    return keypoints
-
-def get_keypoints(img):
-    if FIND_SPARSE_KEYPOINTS:
-        return get_keypoints_sparse(img, N_KEYPOINTS)
-    return detector.detect(img, None)
-
-def int_from_bytes(xbytes: bytes) -> int:
-    return int.from_bytes(xbytes, 'big')
-
-def create_table(conn):
-    cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS img_points (
-            image_id integer NOT NULL UNIQUE,
-            point_id_range int4range NOT NULL)""")
-    cur.execute('CREATE INDEX IF NOT EXISTS point_id_range_gist_index ON img_points USING GIST (point_id_range);')
-    conn.commit()
-
-def prepare_db():
-    connect_settings_postgres = "dbname=postgres host=localhost user=postgres password=12345"
-    connect_settings_ambience = "dbname=ambience host=localhost user=postgres password=12345"
-    conn = psycopg2.connect(connect_settings_postgres)
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM pg_catalog.pg_database WHERE datname = 'ambience'")
-    exists = cur.fetchone()
-    if not exists:
-        conn.commit()
-        conn.autocommit = True
-        cur.execute('CREATE DATABASE ambience')
-        conn = psycopg2.connect(connect_settings_ambience)
-        create_table(conn)
-        return conn
-    else:
-        conn = psycopg2.connect(connect_settings_ambience)
-        create_table(conn)
-        return conn
-
-def int_to_bytes(x: int) -> bytes:
-    return x.to_bytes((x.bit_length() + 7) // 8, 'big')
 
 def init_index():
     global index
@@ -198,14 +67,14 @@ def check_if_image_id_exists(image_id):
     result = cursor.fetchone()
     return result[0]
 
-def get_image_id_by_point_id(point_id):
+def get_image_id_and_file_name_by_point_id(point_id):
     cursor = DB_img_points.cursor()
-    cursor.execute("SELECT image_id FROM img_points WHERE point_id_range @> %s",[point_id])
+    cursor.execute("SELECT image_id, file_name FROM img_points WHERE point_id_range @> %s",[point_id])
     result = cursor.fetchone()
     if result is None:
         return None
     else:
-        return result[0]
+        return result
 
 def get_point_ids(image_id):
     cursor = DB_img_points.cursor()
@@ -216,10 +85,9 @@ def get_point_ids(image_id):
     else:
         return list(range(result[0].lower,result[0].upper))
 
-
-def add_img_points(image_id,point_id_start,point_id_end):
+def add_img_points(image_id, file_name, point_id_start,point_id_end):
     cursor = DB_img_points.cursor()
-    cursor.execute("INSERT INTO img_points (image_id, point_id_range) VALUES(%s, %s)",[image_id, f'[{point_id_start},{point_id_end}]'])
+    cursor.execute("INSERT INTO img_points (image_id, file_name, point_id_range) VALUES(%s, %s, %s)",[image_id, file_name, f'[{point_id_start},{point_id_end}]'])
     DB_img_points.commit()    
 
 def add_keypoints(point_ids, kpts):
@@ -286,13 +154,15 @@ def get_kpts_and_descs_by_id(image_id):
 def get_features(image_buffer, mirrored=False):
     img = read_img_buffer(image_buffer)
     img = resize_img_to_threshold(img)
+
     img = np.array(img)
     img_hash = hash(img.data.tobytes())
     if img_hash in LRU_CACHE:
         return LRU_CACHE[img_hash]
+        
     if mirrored:
         img = np.fliplr(img)
-    kpts = get_keypoints(img)
+    kpts = keypoint_ops.get_keypoints(img)
     if len(kpts) == 0:
         return None
     with torch.no_grad():
@@ -306,7 +176,7 @@ def get_features(image_buffer, mirrored=False):
     LRU_CACHE[img_hash] = (kpts,descs)
     return kpts, descs
 
-def verify_pydegensac(src_pts,dst_pts,th = 4,  n_iter = 2000):
+def verify_ransac(src_pts,dst_pts,th = 4,  n_iter = 2000):
     _, mask = cv2.findHomography(src_pts, dst_pts, ransacReprojThreshold=th, confidence=0.999, maxIters = n_iter,method=cv2.USAC_MAGSAC)
     return int(mask.sum())
 
@@ -317,16 +187,18 @@ use_smnn_matching, smnn_match_threshold,use_ransac):
     I = I.flatten()
     # print(D)
     # print(I)
-    search_res={}
+    res={}
     for i in range(len(I)):
         if D[i] < matching_threshold:
             point_id = int(I[i])
-            image_id = get_image_id_by_point_id(point_id)
-            if image_id in search_res:
-                search_res[image_id]+=1
+            image_id, file_name = get_image_id_and_file_name_by_point_id(point_id)
+            if image_id in res:
+                res[image_id][0]+=1
             else:
-                search_res[image_id] = 1
-    res=[{"image_id":img_id, "matches":int(matches)} for img_id,matches in sorted(search_res.items(), key=lambda item: item[1],reverse=True) if matches>=knn_min_matches]
+                res[image_id] = [1,file_name]
+
+    res=[{"image_id":img_id, "file_name":val[1], "matches":int(val[0])} for img_id, val in res.items() if val[0] >= knn_min_matches]
+    res.sort(key=lambda item: item["matches"],reverse=True)
     if use_smnn_matching:
         new_res = []
         for item in res:
@@ -335,7 +207,7 @@ use_smnn_matching, smnn_match_threshold,use_ransac):
             if len(dists) != 0:
                 if use_ransac:
                     if len(dists) > 3:
-                        new_res.append({"image_id":item["image_id"],"matches":verify_pydegensac(orig_keypoints[match_ids[:,0]],kpts[match_ids[:,1]])})
+                        new_res.append({"image_id":item["image_id"], "file_name":item["file_name"], "matches":verify_ransac(orig_keypoints[match_ids[:,0]],kpts[match_ids[:,1]])})
                 else:
                     new_res.append({"image_id":item["image_id"],"matches":len(dists)})
         res = sorted(new_res, key=lambda item: item["matches"], reverse=True)
@@ -406,6 +278,7 @@ async def local_features_get_similar_images_by_id_handler(item: Item_local_featu
         similar = local_features_search(kpts, descs, k, k_clusters, knn_min_matches, matching_threshold, use_smnn_matching, smnn_match_threshold, use_ransac)
         return similar
     except:
+        traceback.print_exc()
         raise HTTPException(
             status_code=500, detail="Error in local_features_get_similar_images_by_id_handler")
 
@@ -446,7 +319,8 @@ async def local_features_get_similar_images_by_image_buffer_handler(image: bytes
         kpts, descs = get_features(image)
         similar = local_features_search(kpts, descs, k, k_clusters, knn_min_matches, matching_threshold, use_smnn_matching, smnn_match_threshold, use_ransac)
         return similar
-    except RuntimeError:
+    except:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail="Error in local_features_get_similar_images_by_image_buffer_handler")
 
 
@@ -456,14 +330,14 @@ async def calculate_local_features_handler(image: bytes = File(...), image_id: s
         global DATA_CHANGED_SINCE_LAST_SAVE, LAST_POINT_ID
         image_id = int(image_id)
         if check_if_image_id_exists(image_id):
-            raise HTTPException(status_code=500, detail="Image with this id is already in the db")
+            return Response(content="Image with the same id is already in the db", status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, media_type="text/plain")
         kpts,descs = get_features(image)
         if descs is None:
-            raise HTTPException(status_code=500, detail="No descriptors for this image")
+            return Response(content="No descriptors for this image", status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, media_type="text/plain")
         start = LAST_POINT_ID
         end = LAST_POINT_ID + len(kpts) - 1
         LAST_POINT_ID+=len(kpts)
-        add_img_points(image_id,start,end)
+        add_img_points(image_id,f"{image_id}.online",start,end)
         point_ids = list(range(start,end+1))
         point_ids_bytes = [int_to_bytes(x) for x in point_ids]
         add_keypoints(point_ids_bytes, kpts)
@@ -471,8 +345,8 @@ async def calculate_local_features_handler(image: bytes = File(...), image_id: s
         index.add_with_ids(descs, np.int64(point_ids))
         DATA_CHANGED_SINCE_LAST_SAVE = True
         return Response(status_code=status.HTTP_200_OK)
-    except Exception as e:
-        print(e)
+    except:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail="Can't calculate local features")
 
 
@@ -496,6 +370,7 @@ async def delete_local_features_handler(item: Item_delete_local_features):
         else:
             raise HTTPException(status_code=500, detail="Image with this id is not found")
     except:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail="Can't delete local features")
 
 def periodically_save_index(loop):

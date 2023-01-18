@@ -2,10 +2,12 @@ from tqdm import tqdm
 import numpy as np
 import lmdb
 import faiss
+from modules.byte_ops import int_from_bytes
+
 dim = 128
 DB_descriptors = lmdb.open("descriptors.lmdb", readonly=True)
 index = faiss.read_index("./trained.index")
-USE_GPU = True
+USE_GPU = False
 
 if USE_GPU:
     index_ivf = faiss.extract_index_ivf(index)
@@ -13,8 +15,6 @@ if USE_GPU:
     quantizer_gpu = faiss.index_cpu_to_all_gpus(quantizer)
     index_ivf.quantizer = quantizer_gpu
 
-def int_from_bytes(xbytes: bytes) -> int:
-    return int.from_bytes(xbytes, 'big')
 
 def get_all_data_iterator(batch_size=1_000_000):
     with DB_descriptors.begin(buffers=True) as txn:

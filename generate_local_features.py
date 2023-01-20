@@ -67,7 +67,6 @@ def collate_wrapper(batch):
 if __name__ == '__main__': #entry point 
     import torch
     from os import listdir
-    import lmdb
     from tqdm import tqdm
     import kornia.feature as KF
     from kornia_moons import feature
@@ -78,7 +77,6 @@ if __name__ == '__main__': #entry point
     from modules.byte_ops import int_to_bytes
     from modules.lmdb_ops import get_dbs, get_last_point_id
 
-    # from modu
     import argparse
     torch.multiprocessing.set_start_method('spawn') # to avoid problems when trying to fork process where torch is imported (CUDA problems)
 

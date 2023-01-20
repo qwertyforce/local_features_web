@@ -20,6 +20,7 @@ from kornia_moons import feature
 from PIL import Image
 import io 
 from lru import LRU
+from tqdm import tqdm
 
 from modules.psql_ops import prepare_db 
 from modules.byte_ops import int_to_bytes
@@ -201,15 +202,17 @@ use_smnn_matching, smnn_match_threshold,use_ransac):
     res.sort(key=lambda item: item["matches"],reverse=True)
     if use_smnn_matching:
         new_res = []
-        for item in res:
+        target_features = torch.from_numpy(target_features).to(device)
+        for item in tqdm(res):
             kpts, descs = get_kpts_and_descs_by_id(item["image_id"])
-            dists, match_ids = KF.match_smnn(torch.from_numpy(target_features), torch.from_numpy(descs), smnn_match_threshold)
+            dists, match_ids = KF.match_smnn(target_features, torch.from_numpy(descs).to(device), smnn_match_threshold)
             if len(dists) != 0:
+                match_ids = match_ids.cpu()
                 if use_ransac:
                     if len(dists) > 3:
                         new_res.append({"image_id":item["image_id"], "file_name":item["file_name"], "matches":verify_ransac(orig_keypoints[match_ids[:,0]],kpts[match_ids[:,1]])})
                 else:
-                    new_res.append({"image_id":item["image_id"],"matches":len(dists)})
+                    new_res.append({"image_id":item["image_id"],"file_name":item["file_name"], "matches":len(dists)})
         res = sorted(new_res, key=lambda item: item["matches"], reverse=True)
     if k:
         return res[:k]

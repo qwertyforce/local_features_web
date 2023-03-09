@@ -381,7 +381,7 @@ async def delete_local_features_handler(item: Item_delete_local_features):
         else:
             image_id = item.image_id
             point_ids = get_point_ids_by_image_id(image_id)
-        print(point_ids)
+        # print(point_ids)
         if len(point_ids) != 0:
             point_ids_bytes = [int_to_bytes(x) for x in point_ids]
 

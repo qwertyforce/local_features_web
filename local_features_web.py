@@ -77,7 +77,7 @@ def get_image_id_and_file_name_by_point_id(point_id):
     else:
         return result
 
-def get_point_ids(image_id):
+def get_point_ids_by_image_id(image_id):
     cursor = DB_img_points.cursor()
     cursor.execute("SELECT point_id_range FROM img_points WHERE image_id = %s",[image_id])
     result = cursor.fetchone()
@@ -86,6 +86,15 @@ def get_point_ids(image_id):
     else:
         return list(range(result[0].lower,result[0].upper))
 
+def get_point_ids_by_filename(file_name):
+    cursor = DB_img_points.cursor()
+    cursor.execute("SELECT point_id_range FROM img_points WHERE file_name = %s",[file_name])
+    result = cursor.fetchone()
+    if result is None:
+        return []
+    else:
+        return list(range(result[0].lower,result[0].upper))
+    
 def add_img_points(image_id, file_name, point_id_start,point_id_end):
     cursor = DB_img_points.cursor()
     cursor.execute("INSERT INTO img_points (image_id, file_name, point_id_range) VALUES(%s, %s, %s)",[image_id, file_name, f'[{point_id_start},{point_id_end}]'])
@@ -104,9 +113,14 @@ def add_descriptors(point_ids, descs):
         with txn.cursor() as curs:
             curs.putmulti(descriptors_data)
 
-def delete_img_points(image_id):
+def delete_img_points_by_image_id(image_id):
     cursor = DB_img_points.cursor()
     cursor.execute("DELETE FROM img_points WHERE image_id = %s",[image_id])
+    DB_img_points.commit()
+
+def delete_img_points_by_filename(file_name):
+    cursor = DB_img_points.cursor()
+    cursor.execute("DELETE FROM img_points WHERE file_name = %s",[file_name])
     DB_img_points.commit()
 
 def delete_descriptors(point_ids):
@@ -354,17 +368,28 @@ async def calculate_local_features_handler(image: bytes = File(...), image_id: s
 
 
 class Item_delete_local_features(BaseModel):
-    image_id: int
+    image_id: Union[int ,None] = None
+    file_name: Union[None,str] = None
 
 @app.post("/delete_local_features")
 async def delete_local_features_handler(item: Item_delete_local_features):
     global DATA_CHANGED_SINCE_LAST_SAVE
     try:
-        image_id = int(item.image_id)
-        point_ids = get_point_ids(image_id)
+        if item.file_name:
+            file_name = item.file_name
+            point_ids = get_point_ids_by_filename(file_name)
+        else:
+            image_id = item.image_id
+            point_ids = get_point_ids_by_image_id(image_id)
+        print(point_ids)
         if len(point_ids) != 0:
             point_ids_bytes = [int_to_bytes(x) for x in point_ids]
-            delete_img_points(image_id)
+
+            if item.file_name:
+                delete_img_points_by_filename(file_name)
+            else:
+                delete_img_points_by_image_id(image_id)
+
             delete_keypoints(point_ids_bytes)
             delete_descriptors(point_ids_bytes)
             index.remove_ids( np.int64(point_ids) )

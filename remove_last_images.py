@@ -45,8 +45,8 @@ def delete_keypoints(point_ids):
 
 
 DB_img_points = prepare_db()
-DB_keypoints = lmdb.open('./keypoints.lmdb',map_size=10 * 1000 * 1_000_000) #6gb
-DB_descriptors = lmdb.open('./descriptors.lmdb',map_size=120 * 1000 * 1_000_000) #120gb
+DB_keypoints = lmdb.open('./data/keypoints.lmdb',map_size=10 * 1000 * 1_000_000) #6gb
+DB_descriptors = lmdb.open('./data/descriptors.lmdb',map_size=120 * 1000 * 1_000_000) #120gb
 
 def get_point_ids(image_id):
     cursor = DB_img_points.cursor()

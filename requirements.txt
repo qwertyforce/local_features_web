@@ -1,4 +1,4 @@
-faiss_cpu==1.7.2
+faiss-cpu==1.7.2
 fastapi==0.81.0
 kornia==0.6.6
 kornia_moons==0.2.1

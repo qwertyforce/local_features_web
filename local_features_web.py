@@ -54,8 +54,8 @@ def main():
 
 def init_index():
     global index
-    if exists("./populated.index"):
-        index = faiss.read_index("./populated.index")
+    if exists("./data/populated.index"):
+        index = faiss.read_index("./data/populated.index")
         index_ivf = faiss.extract_index_ivf(index)
         index_ivf.nprobe = 16
     else:
@@ -148,7 +148,7 @@ def resize_img_to_threshold(img):
     return img
 
 def get_kpts_and_descs_by_id(image_id):
-    point_ids = get_point_ids(image_id)
+    point_ids = get_point_ids_by_image_id(image_id)
     if len(point_ids)==0:
         return None, None
     point_ids = [int_to_bytes(x) for x in point_ids]
@@ -405,7 +405,7 @@ def periodically_save_index(loop):
     global DATA_CHANGED_SINCE_LAST_SAVE, index
     if DATA_CHANGED_SINCE_LAST_SAVE:
         DATA_CHANGED_SINCE_LAST_SAVE=False
-        faiss.write_index(index, "./populated.index")
+        faiss.write_index(index, "./data/populated.index")
     loop.call_later(10, periodically_save_index,loop)
     
 main()

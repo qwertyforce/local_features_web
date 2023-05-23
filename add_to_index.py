@@ -5,8 +5,8 @@ import faiss
 from modules.byte_ops import int_from_bytes
 
 dim = 128
-DB_descriptors = lmdb.open("descriptors.lmdb", readonly=True)
-index = faiss.read_index("./trained.index")
+DB_descriptors = lmdb.open("./data/descriptors.lmdb", readonly=True)
+index = faiss.read_index("./data/trained.index")
 USE_GPU = False
 
 if USE_GPU:
@@ -38,4 +38,4 @@ for ids, descriptors in tqdm(get_all_data_iterator(1_000_000)):
 if USE_GPU:
     index_ivf.quantizer = quantizer
     del quantizer_gpu 
-faiss.write_index(index,"./populated.index")
+faiss.write_index(index,"./data/populated.index")

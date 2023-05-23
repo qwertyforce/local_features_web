@@ -1,8 +1,8 @@
 import lmdb
 from .byte_ops import int_from_bytes
 
-DB_keypoints = lmdb.open('./keypoints.lmdb',map_size=1*1_000_000 * 1000) #1gb
-DB_descriptors = lmdb.open('./descriptors.lmdb',map_size=5*1_000_000 * 1000) #5gb
+DB_keypoints = lmdb.open('./data/keypoints.lmdb',map_size=1*1_000_000 * 1000) #1gb
+DB_descriptors = lmdb.open('./data/descriptors.lmdb',map_size=5*1_000_000 * 1000) #5gb
 
 if DB_keypoints.stat()["entries"] != DB_descriptors.stat()["entries"]:
     print('DB_keypoints.stat()["entries"] != DB_descriptors.stat()["entries"]')

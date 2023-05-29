@@ -59,8 +59,17 @@ def init_index():
         index_ivf = faiss.extract_index_ivf(index)
         index_ivf.nprobe = 16
     else:
-        print("Index is not found! Exiting...")
-        exit()
+        print("Index is not found!")
+        print("Creating empty index")
+        import subprocess
+        try:
+            subprocess.call(['python3', 'add_to_index.py'])
+        except:
+            pass
+        try:                                                 #one of these should exist
+            subprocess.call(['python', 'add_to_index.py']) 
+        except:
+            pass
 
 def check_if_image_id_exists(image_id):
     cursor = DB_img_points.cursor()
